@@ -317,6 +317,26 @@ window.__ModuleLoader__.load({
       return rect.bottom > 0 && rect.top < viewport
     }
 
+    /**
+     * Which chapter a book should open at.
+     *
+     * The chapter last read *here* wins. WeRead's own position only advances
+     * once a report lands, so leaning on it alone reopens every book at its
+     * first chapter — which reads as "it forgot where I was".
+     *
+     * @param positions - remembered positions, keyed by book id.
+     * @param bookId - the book being opened.
+     * @param progressUid - the chapter WeRead's own progress points at.
+     * @param firstUid - the first chapter with real text, as a last resort.
+     */
+    function resumeChapterUid(positions, bookId, progressUid, firstUid) {
+      const remembered = positions === undefined || positions === null ? undefined : positions[String(bookId)]
+      const rememberedUid = remembered === undefined || remembered === null ? 0 : Number(remembered.chapterUid)
+      if (Number.isFinite(rememberedUid) && rememberedUid > 0) return rememberedUid
+      if (Number.isFinite(progressUid) && progressUid > 0) return progressUid
+      return Number.isFinite(firstUid) && firstUid > 0 ? firstUid : 0
+    }
+
     /** The first chapter with real text: catalogs open with 封面/版权 entries. */
     function firstReadableChapterUid(chapters) {
       if (!Array.isArray(chapters) || chapters.length === 0) return 0
@@ -422,6 +442,7 @@ window.__ModuleLoader__.load({
                     wrGoNotes: props.wrGoNotes,
                     onRead: props.onRead,
                     readerReady: props.readerReady,
+                    positions: props.positions,
                     reload,
                   }),
           },
@@ -437,9 +458,10 @@ window.__ModuleLoader__.load({
       const deepLink = detail === null || detail === undefined ? undefined : detail.deepLink
       const reading = progress !== undefined && progress !== null ? progress : undefined
       const chapters = detail !== null && detail !== undefined ? detail.chapters : []
-      const chapterUid = reading !== undefined ? reading.chapterUid : 0
+      const progressUid = reading !== undefined ? reading.chapterUid : 0
       const firstChapterUid = firstReadableChapterUid(chapters)
-      const canReadInPanel = props.readerReady === true && (chapterUid > 0 || firstChapterUid > 0)
+      const chapterUid = resumeChapterUid(props.positions, book.bookId, progressUid, firstChapterUid)
+      const canReadInPanel = props.readerReady === true && chapterUid > 0
       return h(
         'div',
         { className: 'wr-card' },
@@ -514,6 +536,7 @@ window.__ModuleLoader__.load({
           onOpenNotes: props.onOpenNotes,
           onRead: props.onRead,
           readerReady: props.readerReady,
+          positions: props.positions,
           onBack: () => setSelected(null),
         })
       }
@@ -630,9 +653,11 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'wr-actions' },
                 (() => {
-                  const chapterUid = detail.progress !== undefined && detail.progress !== null ? detail.progress.chapterUid : 0
+                  const progressUid =
+                    detail.progress !== undefined && detail.progress !== null ? detail.progress.chapterUid : 0
                   const firstChapterUid = firstReadableChapterUid(detail.chapters)
-                  if (props.readerReady !== true || (chapterUid <= 0 && firstChapterUid <= 0)) return null
+                  const chapterUid = resumeChapterUid(props.positions, props.book.bookId, progressUid, firstChapterUid)
+                  if (props.readerReady !== true || chapterUid <= 0) return null
                   return h(
                     'button',
                     {
@@ -775,7 +800,7 @@ window.__ModuleLoader__.load({
     // --- 阅读器 ---------------------------------------------------------------
 
     function ReaderView(props) {
-      const { wrCall, bookId, bookTitle, syncEnabled, onBack, onAppearance } = props
+      const { wrCall, bookId, bookTitle, syncEnabled, onBack, onAppearance, onChapter } = props
       const [chapterUid, setChapterUid] = React.useState(props.chapterUid)
       const [appearance, setAppearance] = React.useState(() => ({
         ...APPEARANCE_FALLBACK,
@@ -810,6 +835,7 @@ window.__ModuleLoader__.load({
         if (lastChapterRef.current !== chapterUid) {
           void flushRef.current?.(false)
           lastChapterRef.current = chapterUid
+          if (typeof onChapter === 'function') onChapter(chapterUid)
           positionRef.current = { chapterUid, ratio: 0 }
           readingRef.current = { ...readingRef.current, lastCountedAt: Date.now() }
           if (bodyRef.current !== null) bodyRef.current.scrollTop = 0
@@ -1276,6 +1302,9 @@ window.__ModuleLoader__.load({
       const [notesBook, setNotesBook] = React.useState(undefined)
       const [nonce, setNonce] = React.useState(0)
       const [reader, setReader] = React.useState(null)
+      // Mirrors the host's remembered positions, so opening a book resumes it
+      // even before the next status read lands.
+      const [positions, setPositions] = React.useState({})
       // One local status read decides whether the in-panel reader is offered
       // at all, so the views never show a button that can only fail.
       const [statusState, reloadStatus] = useLoader(() =>
@@ -1286,6 +1315,20 @@ window.__ModuleLoader__.load({
       const status = statusState.status === 'ready' ? statusState.value : undefined
       const readerReady = status !== undefined && status.cookieConfigured === true
       const syncEnabled = status !== undefined && status.syncProgress === true
+
+      React.useEffect(() => {
+        if (status !== undefined && status.positions !== undefined) setPositions(status.positions)
+      }, [status])
+
+      /** Remember the chapter a book is open at, here and on the host. */
+      const remember = (bookId, chapterUid) => {
+        const uid = Number(chapterUid)
+        if (!Number.isFinite(uid) || uid <= 0) return
+        setPositions({ ...positions, [String(bookId)]: { chapterUid: uid, updatedAt: Date.now() } })
+        if (typeof wrCall === 'function') {
+          void Promise.resolve(wrCall('rememberPosition', { bookId, chapterUid: uid })).catch(() => {})
+        }
+      }
 
       const openNotes = (book) => {
         setNotesBook(book)
@@ -1308,6 +1351,7 @@ window.__ModuleLoader__.load({
         if (request === null || request === undefined) return
         const chapterUid = Number(request.chapterUid) > 0 ? Number(request.chapterUid) : Number(request.firstChapterUid)
         if (!Number.isFinite(chapterUid) || chapterUid <= 0) return
+        remember(request.bookId, chapterUid)
         setReader({ bookId: request.bookId, chapterUid, title: request.title ?? '' })
       }
 
@@ -1330,6 +1374,7 @@ window.__ModuleLoader__.load({
             syncEnabled,
             readerSettings: status === undefined ? undefined : status.reader,
             onAppearance: saveAppearance,
+            onChapter: (uid) => remember(reader.bookId, uid),
             onBack: () => setReader(null),
           }),
         )
@@ -1346,6 +1391,7 @@ window.__ModuleLoader__.load({
           onOpenNotes: openNotes,
           onRead: openReader,
           readerReady,
+          positions,
           refresh: false,
         })
       } else if (view === 'notes') {
@@ -1359,6 +1405,7 @@ window.__ModuleLoader__.load({
           wrOpenReader,
           onRead: openReader,
           readerReady,
+          positions,
           wrGoNotes: openNotes,
           wrGoShelf: () => setView('shelf'),
         })
@@ -1412,6 +1459,7 @@ window.__ModuleLoader__.load({
         measurePosition,
         creditReadingTime,
         isOnScreen,
+        resumeChapterUid,
         Loaded,
         Progress,
         Cover,

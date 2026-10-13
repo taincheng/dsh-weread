@@ -63,7 +63,6 @@ globalThis.document = {
 
 let hooks = []
 let hookIndex = 0
-let runEffects = false
 let pendingEffects = []
 /** Every function component the render produced, so views can be driven directly. */
 const components = new Map()
@@ -90,8 +89,20 @@ const ReactShim = {
       store[index] = typeof next === 'function' ? next(store[index]) : next
     }]
   },
-  useEffect: (callback) => {
-    if (runEffects) pendingEffects.push(callback)
+  // Dep-aware, like React: an effect is queued when its dependencies change,
+  // so a state change made between passes re-runs what depends on it.
+  useEffect: (callback, deps) => {
+    const store = hooks
+    const index = hookIndex++
+    const previous = store[index]
+    const same =
+      previous !== undefined &&
+      deps !== undefined &&
+      previous.deps.length === deps.length &&
+      deps.every((value, at) => Object.is(value, previous.deps[at]))
+    if (same) return
+    store[index] = { deps: deps === undefined ? [] : deps }
+    pendingEffects.push(callback)
   },
   useRef: (initial) => {
     const store = hooks
@@ -271,21 +282,28 @@ async function settle() {
  * Render one exposed component to its final tree: expand with effects live,
  * let the loaders settle, then expand again with the published state.
  */
+/** Run whatever effects the last render queued, then let promises settle. */
+async function flushEffects() {
+  const queued = pendingEffects.splice(0, pendingEffects.length)
+  for (const effect of queued) effect()
+  if (queued.length > 0) await settle()
+}
+
 async function renderView(name, props, preset) {
   const component = views[name]
   if (typeof component !== 'function') throw new Error(`view ${name} is not exposed`)
   hookStores.delete(component)
   pendingEffects = []
-  runEffects = true
   expand(within(component, () => component(props)))
-  for (const effect of pendingEffects) effect()
-  runEffects = false
-  await settle()
-  // A preset rewrites this component's own hook slots between the two passes,
-  // which is how a state-gated row is opened without a click.
+  await flushEffects()
+  // A preset rewrites this component's own hook slots between passes, which is
+  // how a state-gated row, or a state the reader would reach by paging, is set
+  // without a click.
   if (preset !== undefined) preset(hookStores.get(component))
-  hookIndex = 0
-  return expand(within(component, () => component(props)))
+  let tree = expand(within(component, () => component(props)))
+  await flushEffects()
+  tree = expand(within(component, () => component(props)))
+  return tree
 }
 
 /** Collect every string in a rendered tree, flattening nested arrays. */
@@ -417,6 +435,39 @@ console.log('\nnow view with live data')
   check('the in-panel reader is offered', button !== undefined)
   button?.props.onClick()
   check('it opens the position the reader is actually at', opened[0]?.chapterUid === 415, JSON.stringify(opened[0]))
+}
+
+console.log('\nnow view resuming a book read in the panel')
+{
+  const opened = []
+  const now = await renderView('NowView', {
+    wrCall: async (endpoint) =>
+      endpoint === 'current'
+        ? { book: BOOK, progress: { progress: 45, chapterUid: 415, recordReadingTime: 3600 } }
+        : DETAIL,
+    wrOpenReader: () => {},
+    wrGoNotes: () => {},
+    onRead: (request) => opened.push(request),
+    readerReady: true,
+    wrGoShelf: () => {},
+    // Read to chapter 14 here, while WeRead's own position still says 415.
+    positions: { '1000001': { chapterUid: 14, updatedAt: 1 } },
+  })
+  findButton(now, '在 DSH 里读')?.props.onClick()
+  check('a book read here resumes where it was left', opened[0]?.chapterUid === 14, JSON.stringify(opened[0]))
+}
+
+console.log('\nresume decision (pure)')
+{
+  const resume = views.resumeChapterUid
+  check('the resume helper is exposed for testing', typeof resume === 'function')
+  check('a remembered chapter wins', resume({ '5': { chapterUid: 14 } }, '5', 415, 3) === 14)
+  check('without a memory, WeRead progress is used', resume({}, '5', 415, 3) === 415)
+  check('without either, the first readable chapter is used', resume({}, '5', 0, 3) === 3)
+  check('with nothing at all it is 0', resume({}, '5', 0, 0) === 0)
+  check('another book does not leak in', resume({ '6': { chapterUid: 99 } }, '5', 415, 3) === 415)
+  check('a corrupt memory is ignored', resume({ '5': { chapterUid: 'x' } }, '5', 415, 3) === 415)
+  check('a missing positions map is tolerated', resume(undefined, '5', 415, 3) === 415)
 }
 
 console.log('\nnow view with an empty shelf')
@@ -639,6 +690,33 @@ console.log('\nreading position reporting')
   check('it no longer sends a hard-coded offset', report?.payload?.chapterOffset === undefined, JSON.stringify(report?.payload))
   check('it reports the chapter that was actually being read', report?.payload?.chapterUid === 13, JSON.stringify(report?.payload))
   check('it reports the time actually spent reading', report?.payload?.elapsedSeconds === 125, String(report?.payload?.elapsedSeconds))
+}
+
+console.log('\nreader reports chapter changes so a book can be resumed')
+{
+  const seen = []
+  // The harness renders twice rather than reacting to clicks, so the state a
+  // click on 下一章 would set is preset here; the reader's own effect then has
+  // to notice and report it.
+  await renderView(
+    'ReaderView',
+    {
+      wrCall: async () => CHAPTER,
+      bookId: '1000001',
+      bookTitle: BOOK.title,
+      chapterUid: 13,
+      syncEnabled: false,
+      readerSettings: { theme: 'follow', fontSize: 17, lineHeight: 1.9, fontFamily: 'system' },
+      onAppearance: () => {},
+      onBack: () => {},
+      onChapter: (uid) => seen.push(uid),
+    },
+    (state) => {
+      state[0] = 14
+    },
+  )
+  check('paging forward reports the new chapter', seen[0] === 14, JSON.stringify(seen))
+  check('opening a chapter does not report it as a change', seen.length === 1, JSON.stringify(seen))
 }
 
 console.log('\nreading-time accounting (idle is not reading)')

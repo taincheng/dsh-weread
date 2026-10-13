@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { estimateProgress, WereadService } from '../lib/service.js'
+import { normalizePositions } from '../lib/store.js'
 import { registerTools } from '../lib/tools.js'
 
 let failures = 0
@@ -135,6 +136,50 @@ try {
 
     const noWords = [{ wordCount: 0 }, { wordCount: 0 }, { wordCount: 0 }, { wordCount: 0 }]
     check('a catalog without word counts falls back to ordinal', estimateProgress(noWords, 1, 0) === 50, String(estimateProgress(noWords, 1, 0)))
+  }
+
+  console.log('\nremembered reading positions')
+  {
+    const raw = {
+      '5': { chapterUid: 14, updatedAt: 20 },
+      '6': { chapterUid: '31', updatedAt: 10 },
+      '7': { chapterUid: 0, updatedAt: 30 },
+      '8': { chapterUid: 'nonsense', updatedAt: 40 },
+      '9': null,
+    }
+    const normalized = normalizePositions(raw)
+    check('a valid position is kept', normalized['5']?.chapterUid === 14)
+    check('a numeric string is accepted', normalized['6']?.chapterUid === 31)
+    check('a zero chapter is dropped', normalized['7'] === undefined)
+    check('a non-numeric chapter is dropped', normalized['8'] === undefined)
+    check('a null entry is dropped', normalized['9'] === undefined)
+    check('junk input becomes an empty map', Object.keys(normalizePositions('nope')).length === 0)
+
+    const many = {}
+    for (let i = 1; i <= 205; i += 1) many[String(i)] = { chapterUid: i, updatedAt: i }
+    const capped = normalizePositions(many)
+    check('the map is bounded', Object.keys(capped).length === 200, String(Object.keys(capped).length))
+    check('the oldest entries fall off first', capped['5'] === undefined && capped['6']?.chapterUid === 6)
+    check('the newest entry survives', capped['205']?.chapterUid === 205)
+
+    const remembered = await service.handleRpc('rememberPosition', { bookId: '837932', chapterUid: 96 })
+    check('a position can be remembered', remembered.value?.chapterUid === 96, JSON.stringify(remembered.value))
+
+    const status = await service.handleRpc('status', {})
+    check('status carries the positions', status.value?.positions?.['837932']?.chapterUid === 96, JSON.stringify(status.value?.positions))
+
+    // A book opened here must survive a restart, which means the file, not memory.
+    const reopened = new WereadService({
+      ctx: { logger: { info() {}, warn() {}, debug() {} } },
+      config: { dataDir, skillVersion: '1.0.5', requestTimeoutMs: 15000 },
+    })
+    const after = await reopened.status()
+    check('the position survives a fresh service', after.positions?.['837932']?.chapterUid === 96, JSON.stringify(after.positions))
+
+    const bad = await service.handleRpc('rememberPosition', { bookId: '837932', chapterUid: 0 })
+    check('a zero chapter is refused', bad.ok === false && bad.error?.code === 'weread/bad-request', JSON.stringify(bad.error))
+    const missing = await service.handleRpc('rememberPosition', { chapterUid: 5 })
+    check('a missing book is refused', missing.ok === false && missing.error?.code === 'weread/bad-request', JSON.stringify(missing.error))
   }
 
   console.log('\nreading appearance (stored, normalized, partial)')
