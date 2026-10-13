@@ -263,6 +263,38 @@ window.__ModuleLoader__.load({
       return Math.min(1, Math.max(0, chars / total))
     }
 
+    /**
+     * A reader that has not touched the page for this long is not reading.
+     */
+    const READING_IDLE_MS = 60_000
+    /** Report accumulated reading time once this much has built up. */
+    const READING_FLUSH_SECONDS = 120
+    /** Below this, an automatic flush is not worth an account write. */
+    const READING_MIN_SECONDS = 30
+    /** How often the visible counter refreshes. */
+    const READING_DISPLAY_MS = 15_000
+
+    /**
+     * Credit reading time for one tick.
+     *
+     * Wall-clock time is not reading time: the panel stays mounted while you
+     * work elsewhere, and an open tab is not attention. WeRead's own reader
+     * reports the same `rt` field, so a tick counts only when the page is
+     * visible and the reader interacted inside the idle window.
+     *
+     * Pure, so the accounting is testable without timers or a DOM.
+     *
+     * @param state - `{ activeSeconds, lastCountedAt, lastInteractionAt }`.
+     * @param now - the current clock.
+     * @param visible - whether the page is visible.
+     */
+    function creditReadingTime(state, now, visible) {
+      const elapsed = (now - state.lastCountedAt) / 1000
+      const attentive = now - state.lastInteractionAt <= READING_IDLE_MS
+      const credited = visible && attentive && elapsed > 0 ? elapsed : 0
+      return { ...state, activeSeconds: state.activeSeconds + credited, lastCountedAt: now }
+    }
+
     /** The first chapter with real text: catalogs open with 封面/版权 entries. */
     function firstReadableChapterUid(chapters) {
       if (!Array.isArray(chapters) || chapters.length === 0) return 0
@@ -733,21 +765,97 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       // How far through the chapter the reader has scrolled. The host turns
       // this into the book's own position units, because it owns the catalog.
-      const [positionRatio, setPositionRatio] = React.useState(0)
+      // A ref, not state: scrolling must not re-render the whole chapter.
+      const positionRef = React.useRef({ chapterUid: props.chapterUid, ratio: 0 })
       const bodyRef = React.useRef(null)
       const paragraphRefs = React.useRef([])
       const layoutRef = React.useRef({ at: 0, boxes: [] })
-      const enteredAt = React.useRef(Date.now())
+      // Reading-time accounting: only attentive, visible time counts.
+      const readingRef = React.useRef({
+        activeSeconds: 0,
+        lastCountedAt: Date.now(),
+        lastInteractionAt: Date.now(),
+      })
+      const [activeSeconds, setActiveSeconds] = React.useState(0)
+      const summaryRef = React.useRef('')
+      const flushRef = React.useRef(null)
+      const lastChapterRef = React.useRef(props.chapterUid)
       const [state, reload] = useLoader(() => wrCall('chapter', { bookId, chapterUid }), [bookId, chapterUid])
 
       React.useEffect(() => {
-        enteredAt.current = Date.now()
+        // Leaving a chapter reports what was read in it, at its own position,
+        // before the position ref moves on.
+        if (lastChapterRef.current !== chapterUid) {
+          void flushRef.current?.(false)
+          lastChapterRef.current = chapterUid
+          positionRef.current = { chapterUid, ratio: 0 }
+          readingRef.current = { ...readingRef.current, lastCountedAt: Date.now() }
+          if (bodyRef.current !== null) bodyRef.current.scrollTop = 0
+        }
         setMessage(null)
-        setPositionRatio(0)
         layoutRef.current = { at: 0, boxes: [] }
         paragraphRefs.current = []
-        if (bodyRef.current !== null) bodyRef.current.scrollTop = 0
       }, [chapterUid, appearance.fontSize, appearance.lineHeight, appearance.fontFamily])
+
+      // The chapter text is only needed as a short "where you are" summary.
+      React.useEffect(() => {
+        summaryRef.current =
+          state.status === 'ready' && state.value.paragraphs.length > 0
+            ? state.value.paragraphs[0].slice(0, 20)
+            : ''
+      }, [state])
+
+      /**
+       * Report the position, carrying whatever reading time has built up.
+       *
+       * The manual button forces a report; the timer, a chapter change and
+       * leaving the reader only send once the time is worth an account write.
+       */
+      const report = async (force) => {
+        const seconds = Math.floor(readingRef.current.activeSeconds)
+        if (!force && seconds < READING_MIN_SECONDS) return undefined
+        const { chapterUid: uid, ratio } = positionRef.current
+        readingRef.current = { ...readingRef.current, activeSeconds: 0, lastCountedAt: Date.now() }
+        try {
+          return await wrCall('reportProgress', {
+            bookId,
+            chapterUid: uid,
+            positionRatio: ratio,
+            summary: summaryRef.current,
+            elapsedSeconds: seconds,
+          })
+        } catch (error) {
+          // Hand the time back so a later report can retry it.
+          readingRef.current = { ...readingRef.current, activeSeconds: readingRef.current.activeSeconds + seconds }
+          throw error
+        }
+      }
+      flushRef.current = report
+
+      // The accounting ticker, plus the interaction and visibility it needs.
+      React.useEffect(() => {
+        if (syncEnabled !== true) return undefined
+        const interact = () => {
+          readingRef.current = { ...readingRef.current, lastInteractionAt: Date.now() }
+        }
+        const tick = () => {
+          const now = Date.now()
+          const next = creditReadingTime(readingRef.current, now, document.visibilityState === 'visible')
+          readingRef.current = next
+          if (next.activeSeconds >= READING_FLUSH_SECONDS) void flushRef.current?.(false).catch(() => {})
+        }
+        const events = ['pointerdown', 'keydown', 'wheel', 'touchstart', 'scroll']
+        for (const type of events) document.addEventListener(type, interact, { capture: true, passive: true })
+        const ticks = setInterval(tick, 1000)
+        const display = setInterval(() => setActiveSeconds(Math.floor(readingRef.current.activeSeconds)), READING_DISPLAY_MS)
+        return () => {
+          clearInterval(ticks)
+          clearInterval(display)
+          for (const type of events) document.removeEventListener(type, interact, { capture: true })
+          // Leaving the reader keeps what was read rather than dropping it.
+          void flushRef.current?.(false).catch(() => {})
+        }
+      }, [syncEnabled])
 
       /** Measure each paragraph's box, in the reading surface's coordinates. */
       const measureLayout = () => {
@@ -772,11 +880,15 @@ window.__ModuleLoader__.load({
       const trackPosition = () => {
         const element = bodyRef.current
         if (element === null) return
+        readingRef.current = { ...readingRef.current, lastInteractionAt: Date.now() }
         const stamp = Date.now()
         if (layoutRef.current.boxes.length === 0 || stamp - layoutRef.current.at > 250) {
           layoutRef.current = { at: stamp, boxes: measureLayout() }
         }
-        setPositionRatio(measurePosition(element.scrollTop, layoutRef.current.boxes))
+        positionRef.current = {
+          chapterUid,
+          ratio: measurePosition(element.scrollTop, layoutRef.current.boxes),
+        }
       }
 
       // The host is the source of truth; this only mirrors it back in, so a
@@ -801,22 +913,14 @@ window.__ModuleLoader__.load({
       const sync = async () => {
         setBusy(true)
         setMessage(null)
+        const seconds = Math.floor(readingRef.current.activeSeconds)
         try {
-          const value = await wrCall('reportProgress', {
-            bookId,
-            chapterUid,
-            positionRatio,
-            summary:
-              state.status === 'ready' && state.value.paragraphs.length > 0
-                ? state.value.paragraphs[0].slice(0, 20)
-                : '',
-            elapsedSeconds: Math.round((Date.now() - enteredAt.current) / 1000),
-          })
+          const value = await report(true)
           setMessage({
             kind: 'ok',
-            text: `已上报进度：本地估算 ${value.progress}%（面板显示的是官方数值；最终以微信读书为准）。`,
+            text: `已上报：进度按本地估算 ${value.progress}%，阅读时长 ${Math.max(1, Math.round(seconds / 60))} 分钟（面板显示的进度是官方数值；最终以微信读书为准）。`,
           })
-          enteredAt.current = Date.now()
+          setActiveSeconds(0)
         } catch (error) {
           setMessage({ kind: 'error', text: errorText(error) })
         } finally {
@@ -825,10 +929,12 @@ window.__ModuleLoader__.load({
       }
 
       const value = state.status === 'ready' ? state.value : undefined
+      const readLabel =
+        syncEnabled === true && activeSeconds >= 60 ? ` · 本次已读 ${Math.round(activeSeconds / 60)} 分钟` : ''
       const meta =
         value === undefined
           ? `《${bookTitle}》`
-          : `《${bookTitle || value.bookId}》 · ${value.title}${value.chapterIdx >= 0 ? `（${value.chapterIdx + 1}/${value.chapterCount}）` : ''}`
+          : `《${bookTitle || value.bookId}》 · ${value.title}${value.chapterIdx >= 0 ? `（${value.chapterIdx + 1}/${value.chapterCount}）` : ''}${readLabel}`
       return h(
         'div',
         { className: 'wr-reader' },
@@ -1279,6 +1385,7 @@ window.__ModuleLoader__.load({
         // Pure helpers are exposed here too, so the layout maths is testable
         // without a browser layout engine.
         measurePosition,
+        creditReadingTime,
         Loaded,
         Progress,
         Cover,

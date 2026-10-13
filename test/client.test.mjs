@@ -37,7 +37,19 @@ globalThis.window = {
 }
 
 const styleTags = []
+const documentListeners = []
 globalThis.document = {
+  // The reader's accounting effect registers interaction listeners and reads
+  // visibility, so the stub has to carry that much of the DOM surface.
+  visibilityState: 'visible',
+  addEventListener: (type, handler) => {
+    documentListeners.push({ type, handler })
+  },
+  removeEventListener: (type) => {
+    for (let i = documentListeners.length - 1; i >= 0; i -= 1) {
+      if (documentListeners[i].type === type) documentListeners.splice(i, 1)
+    }
+  },
   querySelector: () => null,
   createElement: () => {
     const tag = { dataset: {}, textContent: '' }
@@ -500,6 +512,11 @@ console.log('\nreader view')
   }
   check('next is enabled mid-book', findButton(reader, '下一章')?.props.disabled === false)
   check('an appearance control is offered', findButton(reader, '外观') !== undefined)
+  check(
+    'the reader listens for interaction so idle time is excluded',
+    ['pointerdown', 'keydown', 'wheel', 'scroll'].every((type) => documentListeners.some((l) => l.type === type)),
+    JSON.stringify([...new Set(documentListeners.map((l) => l.type))]),
+  )
   const body = findByAttribute(reader, 'className', 'wr-readerBody wr-theme-follow')
   check('the reading surface defaults to following DSH', body !== undefined)
   check('the default type size is applied', body?.props.style?.fontSize === '17px', JSON.stringify(body?.props.style))
@@ -602,22 +619,49 @@ console.log('\nreading position reporting')
       onAppearance: () => {},
       onBack: () => {},
     },
-    // The scroll position is a hook slot, so the test presets it rather than
-    // driving a real scroll event through a layout engine it does not have.
+    // Position and reading time live in refs, and a real scroll or a real
+    // clock cannot run in this harness, so both are preset between passes.
+    // Slots: 6 = positionRef, 10 = readingRef, 11 = the visible counter.
     (state) => {
-      state[6] = 0.5
+      state[6] = { current: { chapterUid: 13, ratio: 0.5 } }
+      state[10] = { current: { activeSeconds: 125, lastCountedAt: Date.now(), lastInteractionAt: Date.now() } }
+      state[11] = 125
     },
   )
 
   const body = findByAttribute(reader, 'className', 'wr-readerBody wr-theme-follow')
   check('the reading surface tracks scrolling', typeof body?.props.onScroll === 'function')
-  check('each paragraph carries its place in the chapter text', typeof body?.props.onScroll === 'function')
+  check('the accumulated reading time is shown', collect(reader).some((t) => t.includes('本次已读 2 分钟')), JSON.stringify(collect(reader).filter((t) => t.includes('本次'))))
 
   await findButton(reader, '同步进度')?.props.onClick()
   const report = sent.find((call) => call.endpoint === 'reportProgress')
   check('syncing reports the reading position, not a raw offset', report?.payload?.positionRatio === 0.5, JSON.stringify(report?.payload))
   check('it no longer sends a hard-coded offset', report?.payload?.chapterOffset === undefined, JSON.stringify(report?.payload))
-  check('it still reports the chapter and elapsed time', report?.payload?.chapterUid === 13 && typeof report?.payload?.elapsedSeconds === 'number')
+  check('it reports the chapter that was actually being read', report?.payload?.chapterUid === 13, JSON.stringify(report?.payload))
+  check('it reports the time actually spent reading', report?.payload?.elapsedSeconds === 125, String(report?.payload?.elapsedSeconds))
+}
+
+console.log('\nreading-time accounting (idle is not reading)')
+{
+  const credit = views.creditReadingTime
+  check('the pure helper is exposed for testing', typeof credit === 'function')
+
+  // One tick at 11s, last accounted at 10s, last interaction at 10s.
+  const attentive = { activeSeconds: 0, lastCountedAt: 10_000, lastInteractionAt: 10_000 }
+  check('visible and attentive time is credited', credit(attentive, 11_000, true).activeSeconds === 1)
+  check('an invisible page credits nothing', credit(attentive, 11_000, false).activeSeconds === 0)
+
+  // Last interaction 61s before the tick, against a 60s idle window.
+  const idle = { activeSeconds: 0, lastCountedAt: 10_000, lastInteractionAt: -50_000 }
+  check('idle time is not credited', credit(idle, 11_000, true).activeSeconds === 0, String(credit(idle, 11_000, true).activeSeconds))
+
+  // The clock advances either way, so a skipped tick cannot be credited later.
+  const skipped = credit(idle, 11_000, true)
+  check('the clock advances even when nothing is credited', skipped.lastCountedAt === 11_000)
+  check('a later tick only credits its own delta', credit({ ...skipped, lastInteractionAt: 11_000 }, 11_500, true).activeSeconds === 0.5)
+
+  const carried = credit({ activeSeconds: 5, lastCountedAt: 10_000, lastInteractionAt: 10_000 }, 11_000, true)
+  check('accumulated time is carried across ticks', carried.activeSeconds === 6, String(carried.activeSeconds))
 }
 
 console.log('\nposition measuring (paragraph text, not scroll height)')
