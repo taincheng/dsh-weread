@@ -295,6 +295,28 @@ window.__ModuleLoader__.load({
       return { ...state, activeSeconds: state.activeSeconds + credited, lastCountedAt: now }
     }
 
+    /**
+     * Whether the reader is actually on screen.
+     *
+     * A mounted view is not a viewed one: DSH keeps this tab mounted while you
+     * work elsewhere, so `document.visibilityState` stays "visible" and the
+     * page keeps reporting interaction. Without this check the book accrues
+     * reading time for as long as the tab is open.
+     *
+     * @param element - the reading surface.
+     * @param viewport - the current viewport height.
+     */
+    function isOnScreen(element, viewport) {
+      if (element === null || element === undefined) return false
+      // A `display: none` ancestor leaves the element with no client rects.
+      if (typeof element.getClientRects === 'function' && element.getClientRects().length === 0) return false
+      if (typeof element.getBoundingClientRect !== 'function') return false
+      const rect = element.getBoundingClientRect()
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false
+      if (!(viewport > 0)) return false
+      return rect.bottom > 0 && rect.top < viewport
+    }
+
     /** The first chapter with real text: catalogs open with 封面/版权 entries. */
     function firstReadableChapterUid(chapters) {
       if (!Array.isArray(chapters) || chapters.length === 0) return 0
@@ -840,7 +862,10 @@ window.__ModuleLoader__.load({
         }
         const tick = () => {
           const now = Date.now()
-          const next = creditReadingTime(readingRef.current, now, document.visibilityState === 'visible')
+          // Reading time belongs to the book you are looking at, not to the
+          // app being open: the tab stays mounted while you work elsewhere.
+          const watching = isOnScreen(bodyRef.current, window.innerHeight || 0)
+          const next = creditReadingTime(readingRef.current, now, watching && document.visibilityState === 'visible')
           readingRef.current = next
           if (next.activeSeconds >= READING_FLUSH_SECONDS) void flushRef.current?.(false).catch(() => {})
         }
@@ -1386,6 +1411,7 @@ window.__ModuleLoader__.load({
         // without a browser layout engine.
         measurePosition,
         creditReadingTime,
+        isOnScreen,
         Loaded,
         Progress,
         Cover,

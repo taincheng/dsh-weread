@@ -662,6 +662,25 @@ console.log('\nreading-time accounting (idle is not reading)')
 
   const carried = credit({ activeSeconds: 5, lastCountedAt: 10_000, lastInteractionAt: 10_000 }, 11_000, true)
   check('accumulated time is carried across ticks', carried.activeSeconds === 6, String(carried.activeSeconds))
+
+  // A mounted-but-hidden tab must not accrue time: DSH keeps this view mounted
+  // while the reader works elsewhere, and `document.visibilityState` stays
+  // "visible" the whole time.
+  const onScreen = views.isOnScreen
+  check('the on-screen helper is exposed for testing', typeof onScreen === 'function')
+  const box = (top, height) => ({
+    getClientRects: () => [{}],
+    getBoundingClientRect: () => ({ top, bottom: top + height, width: 600, height }),
+  })
+  check('a visible reader is on screen', onScreen(box(0, 400), 800) === true)
+  check('a reader scrolled past the top is off screen', onScreen(box(-900, 400), 800) === false)
+  check('a reader below the fold is off screen', onScreen(box(900, 400), 800) === false)
+  check(
+    'a display:none ancestor takes the reader off screen',
+    onScreen({ getClientRects: () => [], getBoundingClientRect: () => ({ top: 0, bottom: 400, width: 600, height: 400 }) }, 800) === false,
+  )
+  check('a zero-size reader is off screen', onScreen(box(0, 0), 800) === false)
+  check('no element is off screen', onScreen(null, 800) === false)
 }
 
 console.log('\nposition measuring (paragraph text, not scroll height)')
