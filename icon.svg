@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="微信读书">
+  <rect width="48" height="48" rx="10" fill="#2f7d4f"/>
+  <g fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M24 15.5c-3-2.4-6.7-3.5-11.5-3.5v22c4.8 0 8.5 1.1 11.5 3.5 3-2.4 6.7-3.5 11.5-3.5V12c-4.8 0-8.5 1.1-11.5 3.5Z"/>
+    <path d="M24 15.5v22"/>
+  </g>
+</svg>

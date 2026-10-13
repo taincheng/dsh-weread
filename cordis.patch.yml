@@ -1,0 +1,17 @@
+# dsh-weread bundle layer.
+#
+# Inserts one host row. Data (shelf / progress / notes / stats / search) comes
+# from the official 微信读书 Agent Gateway, and credentials are entered from
+# the plugin's own sidebar panel, so the row's config only carries defaults.
+- insert:
+    - id: weread
+      name: dsh-weread
+      config:
+        # Must match the skill_version the gateway expects; the response's
+        # upgrade_info field is surfaced in the panel when it moves.
+        skillVersion: '1.0.5'
+        # The initial default only. Writing reading progress back to 微信读书
+        # is an account mutation, so the panel owns a runtime switch that
+        # overrides this value without editing any file.
+        syncProgress: true
+        requestTimeoutMs: 20000

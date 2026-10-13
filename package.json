@@ -1,0 +1,44 @@
+{
+  "name": "dsh-weread",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "在 DeepSeek Harness 里读微信读书：右侧边栏原生阅读面板 + 供 Agent 调用的阅读数据工具。",
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/host.mjs && node test/crypto.test.mjs && node test/reader.test.mjs && node test/client.test.mjs"
+  },
+  "meta": {
+    "title": "微信读书",
+    "description": "在右侧边栏读书：书架、进度、划线与笔记，并把阅读数据提供给 Agent。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}
