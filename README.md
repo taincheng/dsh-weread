@@ -123,3 +123,7 @@ pnpm test          # 或 node test/host.mjs 等逐个运行
 - API Key 只发送给 `i.weread.qq.com`。
 - Cookie（可选）只发送给 `weread.qq.com`，用于后续的章节正文读取。
 - 所有数据都留在本机，插件不做任何遥测。
+
+## 许可
+
+[MIT](LICENSE) © 2026 taincheng
